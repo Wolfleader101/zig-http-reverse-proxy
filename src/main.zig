@@ -38,12 +38,12 @@ fn startServer(netServer: *std.net.Server) !void {
 
         var httpServer = std.http.Server.init(conn, &headerBuffer);
 
-        while (httpServer.state == .ready) {
-            var req = httpServer.receiveHead() catch |err| {
-                std.debug.print("Error Receiving HTTP Head: {}\n", .{err});
-                continue :tcp_accept;
-            };
+        var req = httpServer.receiveHead() catch |err| {
+            std.debug.print("Error Receiving HTTP Head: {}\n", .{err});
+            continue :tcp_accept;
+        };
 
+        {
             var thread = std.Thread.spawn(.{}, handleRequest, .{&req}) catch |err| {
                 std.debug.print("Error Spawning Thread: {}\n", .{err});
                 continue :tcp_accept;
@@ -111,9 +111,6 @@ fn handleRequest(req: *std.http.Server.Request) void {
     const extraHeaders = [_]std.http.Header{
         .{ .name = "Content-Type", .value = proxyRes.res.content_type orelse "text/plain" },
     };
-
-    // print the content type of the response
-    std.debug.print("Content-Type: {s}\n", .{proxyRes.res.content_type.?});
 
     req.respond(proxyRes.body.items, .{ .status = proxyRes.res.status, .extra_headers = &extraHeaders }) catch |err| {
         std.debug.print("Error Responding: {}\n", .{err});
