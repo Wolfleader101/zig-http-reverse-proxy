@@ -1,4 +1,5 @@
 const std = @import("std");
+const myfetch = @import("myfetch.zig");
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
@@ -25,90 +26,151 @@ pub fn main() !void {
 }
 
 fn startServer(netServer: *std.net.Server) !void {
-    while (netServer.accept()) |conn| {
-        defer conn.stream.close();
-        var headerBuffer: [2048]u8 = undefined;
-
-        var httpServer = std.http.Server.init(conn, &headerBuffer);
-
-        var req = httpServer.receiveHead() catch |err| {
-            std.debug.print("Error Receiving HTTP Head: {}\n", .{err});
+    tcp_accept: while (true) {
+        var conn = netServer.accept() catch |err| {
+            std.debug.print("Error Accepting Connection: {}\n", .{err});
             continue;
         };
 
-        {
+        defer conn.stream.close();
+
+        var headerBuffer: [8000]u8 = undefined;
+
+        var httpServer = std.http.Server.init(conn, &headerBuffer);
+
+        while (httpServer.state == .ready) {
+            var req = httpServer.receiveHead() catch |err| {
+                std.debug.print("Error Receiving HTTP Head: {}\n", .{err});
+                continue :tcp_accept;
+            };
+
             var thread = std.Thread.spawn(.{}, handleRequest, .{&req}) catch |err| {
                 std.debug.print("Error Spawning Thread: {}\n", .{err});
-                return err;
+                continue :tcp_accept;
             };
 
             defer thread.join();
         }
-    } else |err| {
-        std.debug.print("Connection to client error: {}\n", .{err});
     }
 }
 
-const RedirectUrl = enum([1024]u8) {
-    api = "http://localhost:8080",
-    static = "http://localhost:8081",
+const RedirectTarget = enum {
+    api,
+    static,
+    pub fn str(self: RedirectTarget) []const u8 {
+        switch (self) {
+            RedirectTarget.api => return "api",
+            RedirectTarget.static => return "static",
+        }
+    }
+    pub fn toUrl(self: RedirectTarget) []const u8 {
+        switch (self) {
+            RedirectTarget.api => return "http://127.0.0.1:8000",
+            RedirectTarget.static => return "http://127.0.0.1:8000",
+        }
+    }
+};
+
+const ProxyResponse = struct {
+    res: std.http.Client.Response,
+    body: std.ArrayList(u8),
 };
 
 fn handleRequest(req: *std.http.Server.Request) void {
-    var responseContent: [1024]u8 = undefined;
-    const responseContentLen = req.head.target.len;
+    // create a new heap allocator
 
-    const ApiTarget = "api";
-    const StaticTarget = "static";
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
 
-    if (std.mem.indexOf(u8, req.head.target, ApiTarget)) |idx| {}
+    var proxyRes: ProxyResponse = undefined;
+    defer proxyRes.body.deinit();
+    if (std.mem.indexOf(u8, req.head.target, RedirectTarget.api.str()) != null) {
+        proxyRes = proxyRequest(req, RedirectTarget.api, gpa.allocator()) catch |err| {
+            std.debug.print("Error Proxying Request: {}\n", .{err});
+            return;
+        };
+    } else if (std.mem.indexOf(u8, req.head.target, RedirectTarget.static.str()) != null) {
+        proxyRes = proxyRequest(req, RedirectTarget.static, gpa.allocator()) catch |err| {
+            std.debug.print("Error Proxying Request: {}\n", .{err});
+            return;
+        };
+    } else {
+        req.respond("Not Found", .{ .status = .not_found }) catch |err| {
+            std.debug.print("Error Responding: {}\n", .{err});
+            return;
+        };
+    }
 
-    _ = std.fmt.bufPrint(responseContent[0..], "{s}", .{req.head.target}) catch |err| {
-        std.debug.print("Error Formatting Response: {}\n", .{err});
-        return;
-    };
+    req.head.version = proxyRes.res.version;
+    req.head.content_type = proxyRes.res.content_type;
+    req.head.keep_alive = proxyRes.res.keep_alive;
+    req.head.content_length = proxyRes.res.content_length;
+    req.head.transfer_encoding = proxyRes.res.transfer_encoding;
+    req.head.transfer_compression = proxyRes.res.transfer_compression;
 
-    req.respond(responseContent[0..responseContentLen], .{}) catch |err| {
+    std.debug.print("Responding: {}\n{s}", .{ proxyRes.res.status, proxyRes.body.items });
+
+    req.respond(proxyRes.body.items, .{ .status = proxyRes.res.status }) catch |err| {
         std.debug.print("Error Responding: {}\n", .{err});
     };
 }
 
-fn proxyRequest(req: *std.http.Server.Request, target: RedirectUrl) !std.http.Client.Response {
-
-    // create a new heap allocator
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer gpa.deinit();
+fn proxyRequest(req: *std.http.Server.Request, target: RedirectTarget, allocator: std.mem.Allocator) !ProxyResponse {
 
     // create a new connection to the target server
     var client = std.http.Client{
-        .allocator = gpa.allocator(),
+        .allocator = allocator,
     };
     defer client.deinit();
 
-    var responseStorage = std.ArrayList(u8){};
+    var responseStorage = std.ArrayList(u8).init(allocator);
 
-    var fetchRes = client.fetch(.{
+    const stripBody = req.head.method == .GET;
+
+    var contentType: std.http.Client.Request.Headers.Value = undefined;
+    if (req.head.content_type) |ct| {
+        contentType = .{ .override = ct };
+    } else {
+        contentType = .default;
+    }
+
+    const contentLengthInt = req.head.content_length orelse 0;
+    var buf: [32]u8 = undefined;
+    const contentLength = try std.fmt.bufPrint(&buf, "{}", .{contentLengthInt});
+
+    const extraHeaders = [_]std.http.Header{
+        .{ .name = "Content-Length", .value = contentLength },
+    };
+
+    const reader = try req.reader();
+    const body = try reader.readAllAlloc(allocator, contentLengthInt);
+    defer allocator.free(body);
+
+    var locBuf: [1024]u8 = undefined;
+    const locationUrl = try std.fmt.bufPrint(&locBuf, "{s}{s}", .{ target.toUrl(), req.head.target });
+
+    std.debug.print("Request: {}\n URL: {s}\n Content-Length: {} \n Body:\n {s}\n", .{ req.head.method, locationUrl, contentLengthInt, body });
+
+    // send the request to the target server
+    // receive the response from the target server
+    const fetchRes = myfetch.my_fetch(&client, .{
+        .location = .{ .url = locationUrl },
         .method = req.head.method,
-        .target = target,
-        .headers = req.head.headers,
-        .body = req.body,
+        .headers = .{ .content_type = contentType },
+        .extra_headers = &extraHeaders,
+        .payload = if (stripBody) null else body,
         .response_storage = .{ .dynamic = &responseStorage },
     }) catch |err| {
+        std.debug.print("Error Fetching: {}\n", .{err});
         return err;
     };
 
-    var cres = std.http.Client.Response{
-        .
-    }
+    std.debug.print("Response: {}\n{s}", .{ fetchRes.status, responseStorage.items });
 
-    const res = std.http.Server.Response{
-        .
+    const proxyRes = ProxyResponse{
+        .res = fetchRes.response,
+        .body = responseStorage,
     };
-    
-
-    // send the request to the target server
-
-    // receive the response from the target server
-
-    // respond to the client with the response from the target server
+    // respond to the client with the response from the target server (headers and body)
+    return proxyRes;
 }
