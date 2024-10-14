@@ -108,9 +108,14 @@ fn handleRequest(req: *std.http.Server.Request) void {
     req.head.transfer_encoding = proxyRes.res.transfer_encoding;
     req.head.transfer_compression = proxyRes.res.transfer_compression;
 
-    std.debug.print("Responding: {}\n{s}", .{ proxyRes.res.status, proxyRes.body.items });
+    const extraHeaders = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = proxyRes.res.content_type orelse "text/plain" },
+    };
 
-    req.respond(proxyRes.body.items, .{ .status = proxyRes.res.status }) catch |err| {
+    // print the content type of the response
+    std.debug.print("Content-Type: {s}\n", .{proxyRes.res.content_type.?});
+
+    req.respond(proxyRes.body.items, .{ .status = proxyRes.res.status, .extra_headers = &extraHeaders }) catch |err| {
         std.debug.print("Error Responding: {}\n", .{err});
     };
 }
@@ -149,8 +154,6 @@ fn proxyRequest(req: *std.http.Server.Request, target: RedirectTarget, allocator
     var locBuf: [1024]u8 = undefined;
     const locationUrl = try std.fmt.bufPrint(&locBuf, "{s}{s}", .{ target.toUrl(), req.head.target });
 
-    std.debug.print("Request: {}\n URL: {s}\n Content-Length: {} \n Body:\n {s}\n", .{ req.head.method, locationUrl, contentLengthInt, body });
-
     // send the request to the target server
     // receive the response from the target server
     const fetchRes = myfetch.my_fetch(&client, .{
@@ -164,8 +167,6 @@ fn proxyRequest(req: *std.http.Server.Request, target: RedirectTarget, allocator
         std.debug.print("Error Fetching: {}\n", .{err});
         return err;
     };
-
-    std.debug.print("Response: {}\n{s}", .{ fetchRes.status, responseStorage.items });
 
     const proxyRes = ProxyResponse{
         .res = fetchRes.response,
