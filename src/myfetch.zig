@@ -5,15 +5,10 @@ const FetchOptions = std.http.Client.FetchOptions;
 const Uri = std.Uri;
 const assert = std.debug.assert;
 
-pub const MyFetchResult = struct {
-    status: http.Status,
-    response: std.http.Client.Response,
-};
-
 /// Perform a one-shot HTTP request with the provided options.
 ///
 /// This function is threadsafe.
-pub fn my_fetch(client: *Client, options: FetchOptions) !MyFetchResult {
+pub fn my_fetch(client: *Client, options: FetchOptions) !std.http.Client.Response {
     const uri = switch (options.location) {
         .url => |u| try Uri.parse(u),
         .uri => |u| u,
@@ -66,8 +61,5 @@ pub fn my_fetch(client: *Client, options: FetchOptions) !MyFetchResult {
         },
     }
 
-    return .{
-        .status = req.response.status,
-        .response = req.response,
-    };
+    return req.response;
 }
